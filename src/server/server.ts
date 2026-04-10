@@ -11,7 +11,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { type DiffMode } from '../types/watch.js';
 import { formatCommentsOutput } from '../utils/commentFormatting.js';
-import { serializeCommentImports } from '../utils/commentImports.js';
+import {
+  mergeCommentImports,
+  normalizeCommentImports,
+  serializeCommentImports,
+} from '../utils/commentImports.js';
 import { normalizeDiffViewMode } from '../utils/diffMode.js';
 import { resolveEditorOption } from '../utils/editorOptions.js';
 import { getFileExtension } from '../utils/fileUtils.js';
@@ -20,18 +24,24 @@ import { FileWatcherService } from './file-watcher.js';
 import { GitDiffParser } from './git-diff.js';
 
 import {
+  type BaseMode,
   type CommentImport,
   type Comment,
   type CommentThread,
   type DiffCommentThread,
   type DiffResponse,
+  type DiffSelection,
   type GeneratedStatusResponse,
   type RevisionsResponse,
 } from '@/types/diff.js';
+import {
+  createDiffSelection,
+  diffSelectionsEqual,
+  getDiffSelectionKey,
+} from '../utils/diffSelection.js';
 
 interface ServerOptions {
-  targetCommitish?: string;
-  baseCommitish?: string;
+  selection?: DiffSelection;
   stdinDiff?: string;
   preferredPort?: number;
   host?: string;
@@ -47,6 +57,41 @@ interface ServerOptions {
 }
 
 const GENERATED_STATUS_CACHE_TTL_MS = 60_000;
+const MAX_DIFF_CACHE_ENTRIES = 8;
+
+function createDiffCacheKey(selection: DiffSelection, ignoreWhitespace: boolean) {
+  return `${getDiffSelectionKey(selection)}\u0000${ignoreWhitespace ? '1' : '0'}`;
+}
+
+function getCachedDiffResponse(
+  cache: Map<string, DiffResponse>,
+  key: string,
+): DiffResponse | undefined {
+  const cached = cache.get(key);
+  if (!cached) {
+    return undefined;
+  }
+
+  // Refresh insertion order to keep the most recently used entry.
+  cache.delete(key);
+  cache.set(key, cached);
+  return cached;
+}
+
+function setCachedDiffResponse(cache: Map<string, DiffResponse>, key: string, value: DiffResponse) {
+  if (cache.has(key)) {
+    cache.delete(key);
+  }
+  cache.set(key, value);
+
+  while (cache.size > MAX_DIFF_CACHE_ENTRIES) {
+    const oldestKey = cache.keys().next().value;
+    if (typeof oldestKey !== 'string') {
+      break;
+    }
+    cache.delete(oldestKey);
+  }
+}
 
 export async function startServer(
   options: ServerOptions,
@@ -55,8 +100,7 @@ export async function startServer(
   const repositoryPath = resolve(options.repoPath ?? process.cwd());
   const repositoryId = createHash('sha256').update(repositoryPath).digest('hex');
   const initialCommentImports = options.commentImports || [];
-  const initialBaseCommitish = options.baseCommitish ?? '';
-  const initialTargetCommitish = options.targetCommitish ?? '';
+  const initialSelection = options.selection ?? createDiffSelection('', '');
   const commentImportId =
     initialCommentImports.length > 0
       ? createHash('sha256').update(serializeCommentImports(initialCommentImports)).digest('hex')
@@ -67,10 +111,16 @@ export async function startServer(
     string,
     { value: GeneratedStatusResponse; expiresAt: number }
   >();
-
-  let diffDataCache: DiffResponse | null = null;
-  let currentIgnoreWhitespace = options.ignoreWhitespace || false;
+  const diffDataCache = new Map<string, DiffResponse>();
+  const initialIgnoreWhitespace = options.ignoreWhitespace || false;
   const diffMode = normalizeDiffViewMode(options.mode);
+  const parseBaseMode = (value: unknown): BaseMode | undefined => {
+    if (value === 'merge-base') {
+      return 'merge-base';
+    }
+
+    return undefined;
+  };
 
   app.use(express.json());
   app.use(express.text()); // For sendBeacon text/plain requests
@@ -84,35 +134,39 @@ export async function startServer(
 
   // Skip validation if using stdin diff
   if (!options.stdinDiff) {
-    const isValidCommit = await parser.validateCommit(options.targetCommitish ?? '');
+    const isValidCommit = await parser.validateCommit(initialSelection.targetCommitish);
     if (!isValidCommit) {
-      throw new Error(`Invalid or non-existent commit: ${options.targetCommitish}`);
+      throw new Error(`Invalid or non-existent commit: ${initialSelection.targetCommitish}`);
     }
   }
 
   // Generate initial diff data for isEmpty check
+  let initialDiffData: DiffResponse;
   if (options.stdinDiff) {
     // Parse stdin diff directly
-    diffDataCache = parser.parseStdinDiff(options.stdinDiff);
+    initialDiffData = parser.parseStdinDiff(options.stdinDiff);
   } else {
-    diffDataCache = await parser.parseDiff(
-      options.targetCommitish ?? '',
-      options.baseCommitish ?? '',
-      currentIgnoreWhitespace,
+    initialDiffData = await parser.parseDiff(
+      initialSelection,
+      initialIgnoreWhitespace,
       options.contextLines,
+    );
+    setCachedDiffResponse(
+      diffDataCache,
+      createDiffCacheKey(initialSelection, initialIgnoreWhitespace),
+      initialDiffData,
     );
   }
 
   // Function to invalidate cache when file changes are detected
   const invalidateCache = () => {
-    diffDataCache = null;
+    diffDataCache.clear();
     generatedStatusCache.clear();
     parser.clearResolvedCommitCache();
   };
 
   // Track current revisions for cache invalidation
-  let currentBaseCommitish = options.baseCommitish ?? '';
-  let currentTargetCommitish = options.targetCommitish ?? '';
+  let currentSelection = initialSelection;
 
   function parseRepositoryRelativePath(
     filepath: unknown,
@@ -139,72 +193,62 @@ export async function startServer(
 
   app.get('/api/diff', async (req, res) => {
     const ignoreWhitespace = req.query.ignoreWhitespace === 'true';
-    const requestedBase = (req.query.base as string) || options.baseCommitish || '';
-    const requestedTarget = (req.query.target as string) || options.targetCommitish || '';
+    const hasBase = typeof req.query.base === 'string';
+    const hasTarget = typeof req.query.target === 'string';
+    const hasBaseMode = typeof req.query.baseMode === 'string';
+    const requestedSelection = createDiffSelection(
+      hasBase ? (req.query.base as string) : currentSelection.baseCommitish,
+      hasTarget ? (req.query.target as string) : currentSelection.targetCommitish,
+      hasBaseMode
+        ? parseBaseMode(req.query.baseMode)
+        : hasBase || hasTarget
+          ? undefined
+          : currentSelection.baseMode,
+    );
     const shouldIncludeCommentImports =
       initialCommentImports.length > 0 &&
-      (Boolean(options.stdinDiff) ||
-        (requestedBase === initialBaseCommitish && requestedTarget === initialTargetCommitish));
+      (Boolean(options.stdinDiff) || diffSelectionsEqual(requestedSelection, initialSelection));
+    currentSelection = requestedSelection;
 
-    // Check if revisions or whitespace setting changed
-    const revisionsChanged =
-      requestedBase !== currentBaseCommitish || requestedTarget !== currentTargetCommitish;
-    const whitespaceChanged = ignoreWhitespace !== currentIgnoreWhitespace;
-
-    // Regenerate diff data if cache is invalid or settings changed
-    if (!diffDataCache || ((revisionsChanged || whitespaceChanged) && !options.stdinDiff)) {
-      currentIgnoreWhitespace = ignoreWhitespace;
-      currentBaseCommitish = requestedBase;
-      currentTargetCommitish = requestedTarget;
-      diffDataCache = await parser.parseDiff(
-        requestedTarget,
-        requestedBase,
-        ignoreWhitespace,
-        options.contextLines,
-      );
-      generatedStatusCache.clear();
-    }
-
-    // Resolve symbolic refs like HEAD/HEAD^ to actual hashes for the UI
-    let resolvedBase = currentBaseCommitish || 'stdin';
-    let resolvedTarget = currentTargetCommitish || 'stdin';
-
-    if (
-      !options.stdinDiff &&
-      currentBaseCommitish &&
-      !['working', 'staged', '.'].includes(currentBaseCommitish)
-    ) {
-      try {
-        resolvedBase = await parser.resolveCommitish(currentBaseCommitish);
-      } catch {
-        // If resolution fails, keep original value
+    let responseDiffData = initialDiffData;
+    if (!options.stdinDiff) {
+      const cacheKey = createDiffCacheKey(requestedSelection, ignoreWhitespace);
+      const cached = getCachedDiffResponse(diffDataCache, cacheKey);
+      if (cached) {
+        responseDiffData = cached;
+      } else {
+        responseDiffData = await parser.parseDiff(
+          requestedSelection,
+          ignoreWhitespace,
+          options.contextLines,
+        );
+        setCachedDiffResponse(diffDataCache, cacheKey, responseDiffData);
+        generatedStatusCache.clear();
       }
     }
 
-    if (
-      !options.stdinDiff &&
-      currentTargetCommitish &&
-      !['working', 'staged', '.'].includes(currentTargetCommitish)
-    ) {
-      try {
-        resolvedTarget = await parser.resolveCommitish(currentTargetCommitish);
-      } catch {
-        // If resolution fails, keep original value
-      }
-    }
-
-    const requestedBaseCommitish = currentBaseCommitish || 'stdin';
-    const requestedTargetCommitish = currentTargetCommitish || 'stdin';
+    const baseCommitish =
+      responseDiffData.baseCommitish ?? (options.stdinDiff ? 'stdin' : undefined);
+    const targetCommitish =
+      responseDiffData.targetCommitish ?? (options.stdinDiff ? 'stdin' : undefined);
+    const requestedBaseCommitish =
+      responseDiffData.requestedBaseCommitish ??
+      (requestedSelection.baseCommitish || (options.stdinDiff ? 'stdin' : undefined));
+    const requestedTargetCommitish =
+      responseDiffData.requestedTargetCommitish ??
+      (requestedSelection.targetCommitish || (options.stdinDiff ? 'stdin' : undefined));
+    const requestedBaseMode = responseDiffData.requestedBaseMode ?? requestedSelection.baseMode;
 
     res.json({
-      ...diffDataCache,
+      ...responseDiffData,
       ignoreWhitespace,
       mode: diffMode,
       openInEditorAvailable: !options.stdinDiff,
-      baseCommitish: resolvedBase,
-      targetCommitish: resolvedTarget,
+      baseCommitish,
+      targetCommitish,
       requestedBaseCommitish,
       requestedTargetCommitish,
+      requestedBaseMode,
       clearComments: options.clearComments,
       repositoryId,
       commentImports: shouldIncludeCommentImports ? initialCommentImports : undefined,
@@ -226,7 +270,7 @@ export async function startServer(
       }
       const normalizedFilepath = filepathResult.path;
 
-      const ref = (req.query.ref as string) || currentTargetCommitish || 'HEAD';
+      const ref = (req.query.ref as string) || currentSelection.targetCommitish || 'HEAD';
       const cacheKey = `${ref}:${normalizedFilepath}`;
       const now = Date.now();
       const cached = generatedStatusCache.get(cacheKey);
@@ -262,7 +306,10 @@ export async function startServer(
 
     try {
       const { branches, commits, originDefaultBranch, resolvedBase, resolvedTarget } =
-        await parser.getRevisionOptions(currentBaseCommitish, currentTargetCommitish);
+        await parser.getRevisionOptions(
+          currentSelection.baseCommitish,
+          currentSelection.targetCommitish,
+        );
 
       const response: RevisionsResponse = {
         specialOptions: [
@@ -468,6 +515,53 @@ export async function startServer(
     }
   });
 
+  function threadToDiffThread(thread: CommentThread): DiffCommentThread {
+    return {
+      id: thread.id,
+      filePath: thread.file,
+      createdAt: thread.createdAt,
+      updatedAt: thread.updatedAt,
+      position: {
+        side: thread.side ?? 'new',
+        line: Array.isArray(thread.line)
+          ? { start: thread.line[0], end: thread.line[1] }
+          : thread.line,
+      },
+      codeSnapshot: thread.codeContent ? { content: thread.codeContent } : undefined,
+      messages: thread.messages,
+    };
+  }
+
+  app.post('/api/comment-imports', (req, res) => {
+    try {
+      const body: unknown =
+        typeof req.body === 'string' ? JSON.parse(req.body as string) : req.body;
+      const imports = normalizeCommentImports(body);
+      const importId = createHash('sha256').update(serializeCommentImports(imports)).digest('hex');
+
+      // Merge imports into server-side threads so they're available via comments-output/comments-json
+      const existingDiffThreads = finalThreads.map(threadToDiffThread);
+      const merged = mergeCommentImports(existingDiffThreads, imports);
+      finalThreads = merged.threads.map(normalizeThreadPayload);
+
+      fileWatcher.broadcastCommentImport({
+        type: 'commentImports',
+        commentImports: imports,
+        commentImportId: importId,
+      });
+
+      res.json({ success: true, importId, count: imports.length });
+    } catch (error) {
+      res.status(400).json({
+        error: error instanceof Error ? error.message : 'Invalid comment import data',
+      });
+    }
+  });
+
+  app.get('/api/comments-json', (_req, res) => {
+    res.json({ threads: finalThreads });
+  });
+
   app.post('/api/open-in-editor', async (req, res) => {
     if (options.stdinDiff) {
       res.status(400).json({ error: 'Open in editor is not available for stdin diff' });
@@ -666,7 +760,7 @@ export async function startServer(
   }
 
   // Check if diff is empty and skip browser opening
-  if (diffDataCache?.isEmpty) {
+  if (initialDiffData.isEmpty) {
     // Don't open browser if no differences found
   } else if (options.openBrowser) {
     try {
@@ -676,7 +770,7 @@ export async function startServer(
     }
   }
 
-  return { port, url, isEmpty: diffDataCache?.isEmpty || false, server };
+  return { port, url, isEmpty: initialDiffData.isEmpty || false, server };
 }
 
 async function startServerWithFallback(

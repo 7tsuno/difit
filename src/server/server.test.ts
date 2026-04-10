@@ -41,6 +41,11 @@ vi.mock('./git-diff.js', () => {
     parseDiff = vi.fn().mockResolvedValue({
       targetCommit: 'abc123',
       baseCommit: 'def456',
+      baseCommitish: 'def4567',
+      targetCommitish: 'abc1234',
+      requestedBaseCommitish: 'HEAD^',
+      requestedTargetCommitish: 'HEAD',
+      requestedBaseMode: undefined,
       targetMessage: 'Test commit',
       baseMessage: 'Previous commit',
       files: [
@@ -216,8 +221,7 @@ describe('Server Integration Tests', () => {
       // Use a high port number to avoid conflicts
       const preferredPort = 9000;
       const result = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         preferredPort,
       });
       servers.push(result.server); // Track for cleanup
@@ -233,16 +237,14 @@ describe('Server Integration Tests', () => {
 
       // Start server on port 9010
       const firstServer = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         preferredPort,
       });
       servers.push(firstServer.server);
 
       // Try to start another server on the same port
       const secondServer = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         preferredPort,
       });
       servers.push(secondServer.server);
@@ -254,8 +256,7 @@ describe('Server Integration Tests', () => {
 
     it('binds to specified host', async () => {
       const result = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         host: '0.0.0.0',
         preferredPort: 9020,
       });
@@ -266,15 +267,18 @@ describe('Server Integration Tests', () => {
 
     it('passes context lines to the initial diff load', async () => {
       const result = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         preferredPort: 9025,
         contextLines: 4,
       });
       servers.push(result.server);
 
       const parser = parserInstances.at(-1);
-      expect(parser?.parseDiff).toHaveBeenCalledWith('HEAD', 'HEAD^', false, 4);
+      expect(parser?.parseDiff).toHaveBeenCalledWith(
+        { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        false,
+        4,
+      );
     });
   });
 
@@ -283,8 +287,7 @@ describe('Server Integration Tests', () => {
 
     beforeEach(async () => {
       const result = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         preferredPort: 9030,
       });
       servers.push(result.server);
@@ -303,6 +306,8 @@ describe('Server Integration Tests', () => {
       expect(data.files[0]).toHaveProperty('path', 'test.js');
       expect(data).toHaveProperty('ignoreWhitespace', false);
       expect(data).toHaveProperty('openInEditorAvailable', true);
+      expect(data).toHaveProperty('requestedBaseCommitish', 'HEAD^');
+      expect(data).toHaveProperty('requestedTargetCommitish', 'HEAD');
     });
 
     it('GET /api/diff?ignoreWhitespace=true handles whitespace ignore', async () => {
@@ -315,8 +320,7 @@ describe('Server Integration Tests', () => {
 
     it('GET /api/diff preserves context lines when recalculating revisions', async () => {
       const result = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         preferredPort: 9031,
         contextLines: 2,
       });
@@ -330,7 +334,122 @@ describe('Server Integration Tests', () => {
       );
 
       expect(response.ok).toBe(true);
-      expect(parser?.parseDiff).toHaveBeenCalledWith('feature', 'main', true, 2);
+      expect(parser?.parseDiff).toHaveBeenCalledWith(
+        { targetCommitish: 'feature', baseCommitish: 'main' },
+        true,
+        2,
+      );
+    });
+
+    it('GET /api/diff passes baseMode through to the parser', async () => {
+      const parser = parserInstances.at(-1);
+      parser?.parseDiff.mockClear();
+      parser?.parseDiff.mockResolvedValueOnce({
+        targetCommit: 'abc123',
+        baseCommit: 'def456',
+        baseCommitish: 'fedcba9',
+        targetCommitish: '.',
+        requestedBaseCommitish: 'origin/main',
+        requestedTargetCommitish: '.',
+        requestedBaseMode: 'merge-base',
+        files: [],
+        isEmpty: true,
+      });
+
+      const response = await fetch(
+        `http://localhost:${port}/api/diff?base=origin%2Fmain&target=.&baseMode=merge-base`,
+      );
+      const data = (await response.json()) as any;
+
+      expect(response.ok).toBe(true);
+      expect(parser?.parseDiff).toHaveBeenCalledWith(
+        {
+          targetCommitish: '.',
+          baseCommitish: 'origin/main',
+          baseMode: 'merge-base',
+        },
+        false,
+        undefined,
+      );
+      expect(data.requestedBaseMode).toBe('merge-base');
+      expect(data.baseCommitish).toBe('fedcba9');
+      expect(data.requestedBaseCommitish).toBe('origin/main');
+    });
+
+    it('GET /api/diff caches results per revision pair instead of reusing the last request', async () => {
+      const result = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        preferredPort: 9032,
+      });
+      servers.push(result.server);
+
+      const parser = parserInstances.at(-1);
+      parser?.parseDiff.mockClear();
+
+      const firstResponse = await fetch(
+        `http://localhost:${result.port}/api/diff?base=main&target=feature`,
+      );
+      expect(firstResponse.ok).toBe(true);
+
+      const secondResponse = await fetch(
+        `http://localhost:${result.port}/api/diff?base=HEAD%5E&target=HEAD`,
+      );
+      expect(secondResponse.ok).toBe(true);
+
+      const thirdResponse = await fetch(
+        `http://localhost:${result.port}/api/diff?base=main&target=feature`,
+      );
+      expect(thirdResponse.ok).toBe(true);
+
+      expect(parser?.parseDiff).toHaveBeenCalledTimes(1);
+      expect(parser?.parseDiff).toHaveBeenNthCalledWith(
+        1,
+        { targetCommitish: 'feature', baseCommitish: 'main' },
+        false,
+        undefined,
+      );
+    });
+
+    it('GET /api/diff evicts least recently used cached diff responses', async () => {
+      const result = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        preferredPort: 9033,
+      });
+      servers.push(result.server);
+
+      const parser = parserInstances.at(-1);
+      parser?.parseDiff.mockClear();
+
+      const revisionPairs = [
+        ['base-a', 'target-a'],
+        ['base-b', 'target-b'],
+        ['base-c', 'target-c'],
+        ['base-d', 'target-d'],
+        ['base-e', 'target-e'],
+        ['base-f', 'target-f'],
+        ['base-g', 'target-g'],
+        ['base-h', 'target-h'],
+        ['base-i', 'target-i'],
+      ] as const;
+
+      for (const [base, target] of revisionPairs) {
+        const response = await fetch(
+          `http://localhost:${result.port}/api/diff?base=${base}&target=${target}`,
+        );
+        expect(response.ok).toBe(true);
+      }
+
+      const revisitedResponse = await fetch(
+        `http://localhost:${result.port}/api/diff?base=base-a&target=target-a`,
+      );
+      expect(revisitedResponse.ok).toBe(true);
+
+      expect(parser?.parseDiff).toHaveBeenCalledTimes(10);
+      expect(parser?.parseDiff).toHaveBeenLastCalledWith(
+        { targetCommitish: 'target-a', baseCommitish: 'base-a' },
+        false,
+        undefined,
+      );
     });
 
     it('GET /api/diff returns comment import payload when configured', async () => {
@@ -344,8 +463,7 @@ describe('Server Integration Tests', () => {
       ];
 
       const importServer = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         preferredPort: 9034,
         commentImports: importedComments,
       });
@@ -370,8 +488,7 @@ describe('Server Integration Tests', () => {
       ];
 
       const importServer = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         preferredPort: 9037,
         clearComments: true,
         commentImports: importedComments,
@@ -398,8 +515,7 @@ describe('Server Integration Tests', () => {
       ];
 
       const importServer = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         preferredPort: 9038,
         commentImports: importedComments,
       });
@@ -547,6 +663,180 @@ describe('Server Integration Tests', () => {
       expect(output).toContain('Total comments: 2');
     });
 
+    it('POST /api/comment-imports accepts valid comment imports', async () => {
+      const imports = [
+        {
+          type: 'thread',
+          filePath: 'src/example.ts',
+          position: { side: 'new', line: 10 },
+          body: 'Review comment',
+        },
+      ];
+
+      const response = await fetch(`http://localhost:${port}/api/comment-imports`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(imports),
+      });
+
+      expect(response.ok).toBe(true);
+      const data = (await response.json()) as any;
+      expect(data.success).toBe(true);
+      expect(data.importId).toEqual(expect.any(String));
+      expect(data.count).toBe(1);
+    });
+
+    it('POST /api/comment-imports accepts a single object', async () => {
+      const singleImport = {
+        type: 'thread',
+        filePath: 'src/example.ts',
+        position: { side: 'new', line: 5 },
+        body: 'Single object import',
+      };
+
+      const response = await fetch(`http://localhost:${port}/api/comment-imports`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(singleImport),
+      });
+
+      expect(response.ok).toBe(true);
+      const data = (await response.json()) as any;
+      expect(data.success).toBe(true);
+      expect(data.count).toBe(1);
+    });
+
+    it('POST /api/comment-imports rejects invalid data', async () => {
+      const response = await fetch(`http://localhost:${port}/api/comment-imports`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ invalid: true }),
+      });
+
+      expect(response.status).toBe(400);
+      const data = (await response.json()) as any;
+      expect(data).toHaveProperty('error');
+    });
+
+    it('GET /api/comments-json returns empty threads by default', async () => {
+      const response = await fetch(`http://localhost:${port}/api/comments-json`);
+
+      expect(response.ok).toBe(true);
+      const data = (await response.json()) as any;
+      expect(data).toHaveProperty('threads');
+      expect(data.threads).toEqual([]);
+    });
+
+    it('GET /api/comments-json returns threads after posting comments', async () => {
+      const comments = [{ file: 'test.js', line: 10, body: 'JSON test comment' }];
+
+      await fetch(`http://localhost:${port}/api/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ comments }),
+      });
+
+      const response = await fetch(`http://localhost:${port}/api/comments-json`);
+
+      expect(response.ok).toBe(true);
+      const data = (await response.json()) as any;
+      expect(data.threads).toHaveLength(1);
+      expect(data.threads[0].messages[0].body).toBe('JSON test comment');
+    });
+
+    it('POST /api/comment-imports merges into server-side threads for comments-output', async () => {
+      const imports = [
+        {
+          type: 'thread',
+          filePath: 'src/example.ts',
+          position: { side: 'new', line: 42 },
+          body: 'Merged server-side comment',
+        },
+      ];
+
+      await fetch(`http://localhost:${port}/api/comment-imports`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(imports),
+      });
+
+      const outputResponse = await fetch(`http://localhost:${port}/api/comments-output`);
+      const output = await outputResponse.text();
+
+      expect(output).toContain('src/example.ts:L42');
+      expect(output).toContain('Merged server-side comment');
+    });
+
+    it('POST /api/comment-imports merges reply into existing thread', async () => {
+      // First add a thread
+      await fetch(`http://localhost:${port}/api/comment-imports`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify([
+          {
+            type: 'thread',
+            filePath: 'src/reply-test.ts',
+            position: { side: 'new', line: 5 },
+            body: 'Original comment',
+            author: 'User',
+          },
+        ]),
+      });
+
+      // Then add a reply
+      await fetch(`http://localhost:${port}/api/comment-imports`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify([
+          {
+            type: 'reply',
+            filePath: 'src/reply-test.ts',
+            position: { side: 'new', line: 5 },
+            body: 'Reply to comment',
+            author: 'AI',
+          },
+        ]),
+      });
+
+      const jsonResponse = await fetch(`http://localhost:${port}/api/comments-json`);
+      const data = (await jsonResponse.json()) as any;
+
+      const thread = data.threads.find((t: any) => t.file === 'src/reply-test.ts');
+      expect(thread).toBeDefined();
+      expect(thread.messages).toHaveLength(2);
+      expect(thread.messages[0].body).toBe('Original comment');
+      expect(thread.messages[1].body).toBe('Reply to comment');
+    });
+
+    it('POST /api/comment-imports deduplicates identical imports', async () => {
+      const imports = [
+        {
+          type: 'thread',
+          filePath: 'src/dedup.ts',
+          position: { side: 'new', line: 1 },
+          body: 'Unique comment',
+        },
+      ];
+
+      // Send the same import twice
+      await fetch(`http://localhost:${port}/api/comment-imports`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(imports),
+      });
+      await fetch(`http://localhost:${port}/api/comment-imports`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(imports),
+      });
+
+      const jsonResponse = await fetch(`http://localhost:${port}/api/comments-json`);
+      const data = (await jsonResponse.json()) as any;
+
+      const threads = data.threads.filter((t: any) => t.file === 'src/dedup.ts');
+      expect(threads).toHaveLength(1);
+    });
+
     it.skip('GET /api/heartbeat returns SSE headers', async () => {
       // Skipped due to connection reset issues in test environment
       // SSE endpoint functionality is verified through manual testing
@@ -603,8 +893,7 @@ describe('Server Integration Tests', () => {
       process.env.NODE_ENV = 'development';
 
       const result = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         preferredPort: 9040,
       });
       servers.push(result.server);
@@ -621,8 +910,7 @@ describe('Server Integration Tests', () => {
       process.env.NODE_ENV = 'production';
 
       const result = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         preferredPort: 9050,
       });
       servers.push(result.server);
@@ -640,8 +928,7 @@ describe('Server Integration Tests', () => {
       process.env.NODE_ENV = 'production';
 
       const result = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         preferredPort: 9055,
       });
       servers.push(result.server);
@@ -656,8 +943,7 @@ describe('Server Integration Tests', () => {
     it('accepts mode option in server configuration', async () => {
       // Test that mode option is accepted without error
       const result = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         mode: 'unified',
       });
       servers.push(result.server);
@@ -668,15 +954,13 @@ describe('Server Integration Tests', () => {
 
     it('accepts different mode values', async () => {
       const inlineResult = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         mode: 'unified',
       });
       servers.push(inlineResult.server);
 
       const sideBySideResult = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         mode: 'split',
       });
       servers.push(sideBySideResult.server);
@@ -687,8 +971,7 @@ describe('Server Integration Tests', () => {
 
     it('mode option should be included in diff response', async () => {
       const result = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         mode: 'inline',
       });
       servers.push(result.server);
@@ -704,8 +987,7 @@ describe('Server Integration Tests', () => {
   describe('Revision options API', () => {
     it('returns available revisions', async () => {
       const result = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
       });
       servers.push(result.server);
 
@@ -714,6 +996,7 @@ describe('Server Integration Tests', () => {
 
       expect(response.ok).toBe(true);
       expect(data.specialOptions).toHaveLength(3);
+      expect(data.specialOptions).not.toContainEqual({ value: 'merge-base', label: 'Merge Base' });
       expect(data.branches).toEqual([{ name: 'main', current: true }]);
       expect(data.commits).toEqual([
         { hash: 'abc1234', shortHash: 'abc1234', message: 'Test commit' },
@@ -733,8 +1016,7 @@ describe('Server Integration Tests', () => {
 
     it('handles malformed comment data', async () => {
       const result = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
       });
       servers.push(result.server);
 
@@ -758,8 +1040,7 @@ describe('Server Integration Tests', () => {
   describe('CORS configuration', () => {
     it('sets correct CORS headers', async () => {
       const result = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
       });
       servers.push(result.server);
 
@@ -780,8 +1061,7 @@ describe('Server Integration Tests', () => {
 
     beforeEach(async () => {
       const result = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         preferredPort: 9050,
       });
       servers.push(result.server);
@@ -825,8 +1105,7 @@ describe('Server Integration Tests', () => {
 
     beforeEach(async () => {
       const result = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         preferredPort: 9060,
       });
       servers.push(result.server);
@@ -929,8 +1208,7 @@ describe('Server Integration Tests', () => {
   describe('Keep-alive option', () => {
     it('accepts keepAlive option without error', async () => {
       const { port, server } = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         keepAlive: true,
       });
       servers.push(server);
@@ -940,8 +1218,7 @@ describe('Server Integration Tests', () => {
 
     it('starts normally without keepAlive option', async () => {
       const { port, server } = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
       });
       servers.push(server);
 
@@ -950,8 +1227,7 @@ describe('Server Integration Tests', () => {
 
     it('does not call process.exit on client disconnect when keepAlive is true', async () => {
       const { port, server } = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         keepAlive: true,
         preferredPort: 9070,
       });
@@ -985,8 +1261,7 @@ describe('Server Integration Tests', () => {
 
     it('calls process.exit on client disconnect when keepAlive is false', async () => {
       const { port, server } = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         keepAlive: false,
         preferredPort: 9080,
       });
@@ -1021,8 +1296,7 @@ describe('Server Integration Tests', () => {
   describe('Clear Comments functionality', () => {
     it('includes clearComments flag in diff response when provided', async () => {
       const { port, server } = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         clearComments: true,
       });
       servers.push(server);
@@ -1036,8 +1310,7 @@ describe('Server Integration Tests', () => {
 
     it('does not include clearComments flag when not provided', async () => {
       const { port, server } = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
       });
       servers.push(server);
 
@@ -1050,8 +1323,7 @@ describe('Server Integration Tests', () => {
 
     it('preserves clearComments flag across diff requests', async () => {
       const { port, server } = await startServer({
-        targetCommitish: 'HEAD',
-        baseCommitish: 'HEAD^',
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         clearComments: true,
       });
       servers.push(server);

@@ -2,7 +2,9 @@ import { Columns, AlignLeft, Settings, PanelLeftClose, PanelLeft, Keyboard } fro
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 
 import {
+  type CommentImport,
   type DiffResponse,
+  type DiffSelection,
   type DiffViewMode,
   type DiffSide,
   type LineNumber,
@@ -10,6 +12,12 @@ import {
   type RevisionsResponse,
 } from '../types/diff';
 import { DEFAULT_DIFF_VIEW_MODE, normalizeDiffViewMode } from '../utils/diffMode';
+import {
+  createDiffSelection,
+  diffSelectionsEqual,
+  getDiffSelectionKey,
+  normalizeBaseMode,
+} from '../utils/diffSelection';
 
 import { Checkbox } from './components/Checkbox';
 import { CommentsDropdown } from './components/CommentsDropdown';
@@ -38,6 +46,11 @@ import { copyTextToClipboard } from './utils/clipboard';
 import { getFileElementId } from './utils/domUtils';
 import { findCommentPosition } from './utils/navigation/positionHelpers';
 import { resolveEventSourceUrl } from './utils/eventSourceUrl';
+import {
+  EMPTY_MERGED_CHUNKS_STATE,
+  buildMergedChunksState,
+  getMergedChunksForVersion,
+} from './utils/mergedChunks';
 
 const EMPTY_COMMENT_THREADS: CommentThread[] = [];
 const EMPTY_MERGED_CHUNKS: MergedChunk[] = [];
@@ -81,6 +94,7 @@ const getInitialFileTreeOpen = () => {
 
 function App() {
   const [diffData, setDiffData] = useState<DiffResponse | null>(null);
+  const [diffDataVersion, setDiffDataVersion] = useState(0);
   const [diffMode, setDiffMode] = useState<DiffViewMode>(DEFAULT_DIFF_VIEW_MODE);
   const hasUserSetDiffModeRef = useRef(false);
   const [ignoreWhitespace, setIgnoreWhitespace] = useState(true);
@@ -101,11 +115,36 @@ function App() {
 
   // Revision selector state
   const [revisionOptions, setRevisionOptions] = useState<RevisionsResponse | null>(null);
-  const [baseRevision, setBaseRevision] = useState<string>('');
-  const [targetRevision, setTargetRevision] = useState<string>('');
+  const [selectedRevision, setSelectedRevision] = useState<DiffSelection>(
+    createDiffSelection('', ''),
+  );
   const [resolvedBaseRevision, setResolvedBaseRevision] = useState<string>('');
   const [resolvedTargetRevision, setResolvedTargetRevision] = useState<string>('');
   const hasUserSelectedRevisionRef = useRef(false);
+  const currentRequestedBaseModeRef = useRef(selectedRevision.baseMode);
+  currentRequestedBaseModeRef.current = diffData?.requestedBaseMode ?? selectedRevision.baseMode;
+  const selectedRevisionRef = useRef(selectedRevision);
+  selectedRevisionRef.current = selectedRevision;
+  const diffRequestIdRef = useRef(0);
+  const activeDiffAbortControllerRef = useRef<AbortController | null>(null);
+  const resolvedSelection = useMemo<DiffSelection | null>(() => {
+    if (!diffData?.baseCommitish || !diffData?.targetCommitish) {
+      return null;
+    }
+
+    return createDiffSelection(
+      diffData.baseCommitish,
+      diffData.targetCommitish,
+      diffData.requestedBaseMode,
+    );
+  }, [diffData]);
+  const resolvedSelectionKey = useMemo(() => {
+    if (!resolvedSelection) {
+      return null;
+    }
+
+    return getDiffSelectionKey(resolvedSelection);
+  }, [resolvedSelection]);
 
   const { settings, updateSettings } = useAppearanceSettings();
   const { isMobile, isDesktop } = useViewport();
@@ -123,11 +162,12 @@ function App() {
     generateThreadPrompt,
     generateAllCommentsPrompt,
   } = useDiffComments(
-    diffData?.baseCommitish,
-    diffData?.targetCommitish,
+    resolvedSelection?.baseCommitish,
+    resolvedSelection?.targetCommitish,
     diffData?.commit, // Using commit as currentCommitHash
     undefined, // branchToHash map - could be populated from server data
     diffData?.repositoryId, // Repository identifier for storage isolation
+    resolvedSelection?.baseMode,
   );
 
   const normalizedThreads = useMemo<CommentThread[]>(
@@ -169,24 +209,20 @@ function App() {
   // Viewed files management
   const { viewedFiles, hasLoadedInitialViewedFiles, toggleFileViewed, clearViewedFiles } =
     useViewedFiles(
-      diffData?.baseCommitish,
-      diffData?.targetCommitish,
+      resolvedSelection?.baseCommitish,
+      resolvedSelection?.targetCommitish,
       diffData?.commit,
       undefined,
       diffData?.files,
       diffData?.repositoryId, // Repository identifier for storage isolation
       settings.autoViewedPatterns,
+      resolvedSelection?.baseMode,
     );
 
   // Reset initialization flag when diff context changes
   useEffect(() => {
     collapsedInitializedRef.current = false;
-  }, [
-    diffData?.repositoryId,
-    diffData?.baseCommitish,
-    diffData?.targetCommitish,
-    diffData?.commit,
-  ]);
+  }, [diffData?.repositoryId, resolvedSelectionKey, diffData?.commit]);
 
   // Initialize collapsed files from viewed files (only once per diff)
   useEffect(() => {
@@ -267,6 +303,10 @@ function App() {
     [diffData],
   );
 
+  const handleMobileFileSelected = useCallback(() => {
+    setIsFileTreeOpen(false);
+  }, []);
+
   const handleDiffModeChange = useCallback((mode: DiffViewMode) => {
     hasUserSetDiffModeRef.current = true;
     setDiffMode(mode);
@@ -279,11 +319,11 @@ function App() {
     expandAllBetweenChunks,
     prefetchFileContent,
     getMergedChunks,
-    lastUpdatedFilePath,
     lastUpdatedAt,
   } = useExpandedLines({
     baseCommitish: diffData?.baseCommitish,
     targetCommitish: diffData?.targetCommitish,
+    diffIdentity: diffDataVersion,
   });
 
   const getMergedChunksRef = useRef(getMergedChunks);
@@ -291,9 +331,7 @@ function App() {
     getMergedChunksRef.current = getMergedChunks;
   }, [getMergedChunks]);
 
-  const [mergedChunksByFile, setMergedChunksByFile] = useState<Map<string, MergedChunk[]>>(
-    new Map(),
-  );
+  const [mergedChunksState, setMergedChunksState] = useState(EMPTY_MERGED_CHUNKS_STATE);
   const filesByPath = useMemo(() => {
     const map = new Map<string, DiffResponse['files'][number]>();
     diffData?.files.forEach((file) => {
@@ -302,61 +340,29 @@ function App() {
     return map;
   }, [diffData]);
 
-  // Compute merged chunks only for currently rendered files
+  // Recompute merged chunks for the current fetched diff only.
   useEffect(() => {
     if (!diffData) {
-      setMergedChunksByFile(new Map());
+      setMergedChunksState(EMPTY_MERGED_CHUNKS_STATE);
       return;
     }
 
-    setMergedChunksByFile((prev) => {
-      let changed = false;
-      const next = new Map(prev);
-      const validPaths = new Set(diffData.files.map((file) => file.path));
-
-      next.forEach((_value, path) => {
-        if (!validPaths.has(path)) {
-          next.delete(path);
-          changed = true;
-        }
-      });
-
-      renderedFilePaths.forEach((path) => {
-        if (next.has(path)) return;
-        const file = filesByPath.get(path);
-        if (!file) return;
-        next.set(path, getMergedChunksRef.current(file));
-        changed = true;
-      });
-
-      return changed ? next : prev;
-    });
-  }, [diffData, filesByPath, renderedFilePaths]);
-
-  // Recompute merged chunks only for the file that changed
-  useEffect(() => {
-    if (!diffData || !lastUpdatedFilePath) return;
-    const file = filesByPath.get(lastUpdatedFilePath);
-    if (!file) return;
-
-    setMergedChunksByFile((prev) => {
-      if (!prev.has(file.path)) {
-        return prev;
-      }
-      const next = new Map(prev);
-      next.set(file.path, getMergedChunksRef.current(file));
-      return next;
-    });
-  }, [diffData, filesByPath, lastUpdatedFilePath, lastUpdatedAt]);
+    setMergedChunksState(
+      buildMergedChunksState(diffDataVersion, renderedFilePaths, filesByPath, (file) =>
+        getMergedChunksRef.current(file),
+      ),
+    );
+  }, [diffData, diffDataVersion, filesByPath, renderedFilePaths, lastUpdatedAt]);
 
   // Create files with merged chunks for keyboard navigation
   const navigableFiles = useMemo(() => {
     if (!diffData) return [];
     return diffData.files.map((file) => ({
       ...file,
-      chunks: mergedChunksByFile.get(file.path) || file.chunks,
+      chunks:
+        getMergedChunksForVersion(mergedChunksState, diffDataVersion, file.path) || file.chunks,
     }));
-  }, [diffData, mergedChunksByFile]);
+  }, [diffData, diffDataVersion, mergedChunksState]);
 
   // State to trigger comment creation from keyboard
   const [commentTrigger, setCommentTrigger] = useState<{
@@ -365,10 +371,19 @@ function App() {
     lineIndex: number;
   } | null>(null);
 
+  // Handle comment imports received via SSE
+  const handleCommentImports = useCallback(
+    (imports: CommentImport[], importId: string) => {
+      const warnings = applyCommentImports(imports, importId);
+      warnings.forEach((warning) => console.warn(warning));
+    },
+    [applyCommentImports],
+  );
+
   // File watch for reload functionality - initialize with callback
   const { shouldReload, reload, watchState } = useFileWatch(async () => {
     await fetchDiffData();
-  });
+  }, handleCommentImports);
 
   const { cursor, isHelpOpen, setIsHelpOpen, setCursorPosition } = useKeyboardNavigation({
     files: navigableFiles,
@@ -461,28 +476,50 @@ function App() {
   };
 
   const fetchDiffData = useCallback(
-    async (base?: string, target?: string) => {
+    async (selection?: DiffSelection) => {
+      const requestId = diffRequestIdRef.current + 1;
+      diffRequestIdRef.current = requestId;
+      activeDiffAbortControllerRef.current?.abort();
+      const controller = new AbortController();
+      activeDiffAbortControllerRef.current = controller;
       try {
+        const requestedSelection =
+          selection ??
+          (hasUserSelectedRevisionRef.current ? selectedRevisionRef.current : undefined);
         const params = new URLSearchParams({
           ignoreWhitespace: String(ignoreWhitespace),
         });
-        if (base) params.set('base', base);
-        if (target) params.set('target', target);
+        if (requestedSelection?.baseCommitish) params.set('base', requestedSelection.baseCommitish);
+        if (requestedSelection?.targetCommitish)
+          params.set('target', requestedSelection.targetCommitish);
+        if (requestedSelection?.baseMode === 'merge-base')
+          params.set('baseMode', requestedSelection.baseMode);
 
-        const response = await fetch(`/api/diff?${params}`);
+        const response = await fetch(`/api/diff?${params}`, {
+          signal: controller.signal,
+        });
         if (!response.ok) throw new Error('Failed to fetch diff data');
         const data = (await response.json()) as DiffResponse;
+        if (diffRequestIdRef.current !== requestId) {
+          return;
+        }
         setDiffData(data);
+        setDiffDataVersion((prev) => prev + 1);
 
         // Update resolved revision state from server response
-        if (data.baseCommitish) setResolvedBaseRevision(data.baseCommitish);
+        setResolvedBaseRevision(
+          data.baseCommitish && data.requestedBaseMode !== 'merge-base' ? data.baseCommitish : '',
+        );
         if (data.targetCommitish) setResolvedTargetRevision(data.targetCommitish);
 
         if (!hasUserSelectedRevisionRef.current) {
           const requestedBase = data.requestedBaseCommitish ?? data.baseCommitish;
           const requestedTarget = data.requestedTargetCommitish ?? data.targetCommitish;
-          if (requestedBase) setBaseRevision(requestedBase);
-          if (requestedTarget) setTargetRevision(requestedTarget);
+          if (requestedBase && requestedTarget) {
+            setSelectedRevision(
+              createDiffSelection(requestedBase, requestedTarget, data.requestedBaseMode),
+            );
+          }
         }
 
         // Set diff mode from server response if provided
@@ -492,9 +529,20 @@ function App() {
 
         // Lock files are now automatically marked as viewed by useViewedFiles hook
       } catch (err) {
+        if ((err as { name?: string } | null)?.name === 'AbortError') {
+          return;
+        }
+        if (diffRequestIdRef.current !== requestId) {
+          return;
+        }
         setError(err instanceof Error ? err.message : 'Unknown error');
       } finally {
-        setLoading(false);
+        if (activeDiffAbortControllerRef.current === controller) {
+          activeDiffAbortControllerRef.current = null;
+        }
+        if (diffRequestIdRef.current === requestId) {
+          setLoading(false);
+        }
       }
     },
     [ignoreWhitespace],
@@ -503,6 +551,12 @@ function App() {
   useEffect(() => {
     void fetchDiffData();
   }, [fetchDiffData]);
+
+  useEffect(() => {
+    return () => {
+      activeDiffAbortControllerRef.current?.abort();
+    };
+  }, []);
 
   useEffect(() => {
     if (isMobile && diffMode !== 'unified') {
@@ -532,7 +586,10 @@ function App() {
       .then((res) => (res.ok ? res.json() : null))
       .then((data: RevisionsResponse | null) => {
         setRevisionOptions(data);
-        if (data?.resolvedBase) {
+        if (
+          data?.resolvedBase &&
+          normalizeBaseMode(currentRequestedBaseModeRef.current) !== 'merge-base'
+        ) {
           setResolvedBaseRevision((prev) => prev || data.resolvedBase || '');
         }
         if (data?.resolvedTarget) {
@@ -544,18 +601,18 @@ function App() {
 
   // Handle revision change
   const handleRevisionChange = useCallback(
-    async (newBase: string, newTarget: string) => {
+    async (nextSelection: DiffSelection) => {
       // Skip if no actual change
-      if (newBase === baseRevision && newTarget === targetRevision) return;
+      if (diffSelectionsEqual(nextSelection, selectedRevision)) return;
 
       hasUserSelectedRevisionRef.current = true;
-      setBaseRevision(newBase);
-      setTargetRevision(newTarget);
+      selectedRevisionRef.current = nextSelection;
+      setSelectedRevision(nextSelection);
       setLoading(true);
       setError(null);
-      await fetchDiffData(newBase, newTarget);
+      await fetchDiffData(nextSelection);
     },
-    [baseRevision, targetRevision, fetchDiffData],
+    [fetchDiffData, selectedRevision],
   );
 
   // Clear comments and viewed files on initial load if requested via CLI flag
@@ -925,11 +982,10 @@ function App() {
               {revisionOptions ? (
                 <DiffQuickMenu
                   options={revisionOptions}
-                  baseRevision={baseRevision}
-                  targetRevision={targetRevision}
+                  selection={selectedRevision}
                   resolvedBaseRevision={resolvedBaseRevision}
                   resolvedTargetRevision={resolvedTargetRevision}
-                  onSelectDiff={(base, target) => void handleRevisionChange(base, target)}
+                  onSelectDiff={(selection) => void handleRevisionChange(selection)}
                   onOpenAdvanced={() => setIsRevisionModalOpen(true)}
                   compact={!isDesktop}
                 />
@@ -955,15 +1011,14 @@ function App() {
         </header>
         {revisionOptions && (
           <RevisionDetailModal
-            key={isRevisionModalOpen ? `${baseRevision}:${targetRevision}` : 'closed'}
+            key={isRevisionModalOpen ? getDiffSelectionKey(selectedRevision) : 'closed'}
             isOpen={isRevisionModalOpen}
             onClose={() => setIsRevisionModalOpen(false)}
             options={revisionOptions}
-            baseRevision={baseRevision}
-            targetRevision={targetRevision}
+            selection={selectedRevision}
             resolvedBaseRevision={resolvedBaseRevision}
             resolvedTargetRevision={resolvedTargetRevision}
-            onApply={(base, target) => void handleRevisionChange(base, target)}
+            onApply={(selection) => void handleRevisionChange(selection)}
           />
         )}
 
@@ -1006,7 +1061,7 @@ function App() {
                 <FileList
                   files={diffData.files}
                   onScrollToFile={scrollFileIntoDiffContainer}
-                  onFileSelected={isMobile ? () => setIsFileTreeOpen(false) : undefined}
+                  onFileSelected={isMobile ? handleMobileFileSelected : undefined}
                   comments={normalizedThreads}
                   reviewedFiles={viewedFiles}
                   onToggleReviewed={toggleFileReviewed}
@@ -1055,7 +1110,9 @@ function App() {
           >
             {diffData.files.map((file, fileIndex) => {
               const fileThreads = threadsByFile.get(file.path) ?? EMPTY_COMMENT_THREADS;
-              const mergedChunks = mergedChunksByFile.get(file.path) ?? EMPTY_MERGED_CHUNKS;
+              const mergedChunks =
+                getMergedChunksForVersion(mergedChunksState, diffDataVersion, file.path) ??
+                EMPTY_MERGED_CHUNKS;
               const isRendered = renderedFilePaths.has(file.path);
               return (
                 <div
